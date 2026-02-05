@@ -69,18 +69,20 @@ hakutulokselle palautuvaa dataa tms.
 ...   async for hakutulos in Hakemisto.haku(...): ...
 '''
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import itertools
 from operator import attrgetter
 import re
 from typing import (
+  Any,
   AsyncIterator,
   Callable,
   ClassVar,
-  Iterable,
   Optional,
   Self,
   Union,
+  cast,
 )
 
 from django.db import models
@@ -89,31 +91,59 @@ from django.http import HttpRequest
 
 @dataclass
 class Hakemisto:
+  ''' Yksittäiseen malliin/sarakkeeseen kohdistuva hakemisto tekstihaulle. '''
+
+  # Malli, josta haetaan.
   malli: type[models.Model]
+
+  # Mallin kenttä, johon haku kohdistuu.
   kentta: str = field(kw_only=True)
+
+  # Mahdollinen kriteeri hakutermille. Ellei täyty, hakemisto ohitetaan.
   hakuehto: Optional[str | re.Pattern] = field(kw_only=True, default=None)
+
+  # Mahdollinen muunnos hakutermille ennen hakua.
+  haku_muunnos: Callable[[str], Any] = field(
+    kw_only=True,
+    default=lambda haku: haku,
+  )
+
+  # Montako hakuun täsmäävää tulosta mallista enintään palautuu?
   enintaan: int = field(kw_only=True, default=3)
+
+  # Hakutulosten suhteellinen relevanssi vrt. muihin hakemistoihin.
   relevanssi: float = field(kw_only=True, default=0.0)
+
+  # Mahdollinen muunnos Django-kyselyyn, josta tuloksia haetaan.
   kysely: Callable[[models.QuerySet], models.QuerySet] = field(
     kw_only=True,
     default=lambda qs: qs,
   )
 
+  # Kaikki ajonaikaisesti rekisteröidyt Hakemistot luettelona.
   hakemistot: ClassVar[list[Self]] = []
 
   @dataclass
   class Hakutulos:
+    ''' Tehtyyn hakuun täsmäävät tietueet yksittäisen Hakemiston osalta. '''
     @dataclass
     class HaettuTietue:
-      teksti: str  # str(tietue)
-      url: str     # tietue.get_absolute_url()
+      ''' Tehtyyn hakuun täsmäävä, yksittäinen tietue. '''
+      teksti: str         # str(tietue)
+      url: Optional[str]  # tietue.get_absolute_url()
 
       @classmethod
       def tietueen_mukaan(cls, tietue: models.Model) -> Self:
         ''' Palauta yksittäisen, haetun tietueen data. '''
         return cls(
           teksti=str(tietue),
-          url=tietue.get_absolute_url(),
+          url=(
+            get_absolute_url()
+            if (
+              get_absolute_url := getattr(tietue, 'get_absolute_url', None)
+            ) is not None
+            else None
+          ),
         )
         # def tietueen_mukaan -> Self
 
@@ -125,7 +155,7 @@ class Hakemisto:
     def tietueiden_mukaan(
       cls,
       malli: type[models.Model],
-      hakemistokohtaiset_tietueet: Iterable[tuple['Hakemisto', models.Model]]
+      hakemistokohtaiset_tietueet: Sequence[tuple['Hakemisto', models.Model]]
     ) -> Self:
       ''' Palauta hakutulos löydetyille tietueille. '''
       return cls(
@@ -150,6 +180,7 @@ class Hakemisto:
     # class Hakutulos
 
   def __post_init__(self):
+    ''' Alusta mahdollinen `hakuehto`; rekisteröi Hakemisto. '''
     if isinstance(self.hakuehto, str):
       self.hakuehto = re.compile(self.hakuehto)
     __class__.hakemistot.append(self)
@@ -180,9 +211,10 @@ class Hakemisto:
     haku: str,
     tietueet: Optional[models.QuerySet] = None
   ) -> AsyncIterator[models.Model]:
+    ''' Toteuta tekstihaku Hakemistolle määritettyjen parametrien mukaan. '''
     async for tulos in self.kysely(
       self.malli.objects.all() if tietueet is None else tietueet
-    ).filter(**{self.kentta: haku})[:self.enintaan]:
+    ).filter(**{self.kentta: self.haku_muunnos(haku)})[:self.enintaan]:
       yield tulos
     # async def tee_haku
 
@@ -238,7 +270,10 @@ class Hakemisto:
           if haku
           and (
             _hakemisto.hakuehto is None
-            or (_hakemisto.hakuehto.match(haku)) is not None
+            or cast(
+              re.Pattern,
+              _hakemisto.hakuehto
+            ).match(haku) is not None
           ) and (tietueet := [
             tietue
             async for tietue in _hakemisto.tee_haku(
